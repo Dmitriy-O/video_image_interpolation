@@ -1,0 +1,7 @@
+gradio>=4.44.0
+opencv-python>=4.9.0
+scikit-learn>=1.4.0
+kmodes>=0.12.2
+pandas>=2.2.0
+numpy>=1.26.0
+plotly>=5.20.0

@@ -1,0 +1,33 @@
+# Віртуальне середовище (не передавати — встановлюється через pip)
+venv/
+.venv/
+env/
+
+# Кеш Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Gradio / тимчасові файли
+.gradio/
+*.log
+adaptive_interp_results.json
+
+# Відео та великі дані (за потреби додайте свої)
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Архіви збірки
+dist/
+*.zip
