@@ -46,6 +46,38 @@ python app.py
 
 Що **не потрібно** в архіві: `venv`, `__pycache__`, `.vscode`, відеофайли, тимчасові JSON з експорту.
 
+## Публікація на GitHub
+
+### 1. Створіть репозиторій на сайті
+
+1. Увійдіть на [github.com](https://github.com).
+2. **New repository** (зелена кнопка або `+` → New repository).
+3. **Repository name:** наприклад `video-interpolation-clustering`.
+4. **Public** (або Private для курсової).
+5. **Не** ставте галочки «Add README» / «Add .gitignore» — вони вже є локально.
+6. Натисніть **Create repository**.
+
+### 2. Зв’яжіть локальний проєкт і завантажте код
+
+У терміналі в папці проєкту (замініть `ВАШ_ЛОГІН` і назву репозиторію):
+
+```bash
+git remote add origin https://github.com/ВАШ_ЛОГІН/video-interpolation-clustering.git
+git push -u origin main
+```
+
+При першому `push` GitHub попросить увійти (браузер або Personal Access Token).
+
+### 3. Оновлення після змін
+
+```bash
+git add .
+git commit -m "Опис змін"
+git push
+```
+
+Локально вже є перший коміт на гілці `main`; папки `venv/` і `dist/` у репозиторій **не потрапляють** (див. `.gitignore`).
+
 ## Структура проєкту
 
 ```
