@@ -166,6 +166,42 @@ def _get_smoothed_policy(labels: np.ndarray, i: int, policy_map: dict[int, str],
     return policy_map.get(maj, 'linear')
 
 
+def _get_blend_alpha(cluster: int, policy: str, profiles: pd.DataFrame | None = None) -> float:
+    """
+    Returns the blend alpha for the given policy and cluster.
+
+    Makes 'biased' and new policies profile-aware (motion-dependent).
+    Higher motion → more conservative (lower alpha, more weight to previous frame).
+    """
+    if policy == 'hold':
+        return 0.0
+    if policy == 'conservative':
+        return 0.25
+    if policy == 'linear':
+        return 0.5
+    if policy == 'forward_biased':
+        return 0.65
+
+    # Default / biased / motion_aware: motion-dependent
+    base_alpha = 0.35
+
+    if profiles is not None and not profiles.empty:
+        motion_col = 'motion_mean_mean'
+        if motion_col in profiles.columns:
+            row = profiles[profiles['cluster'] == cluster]
+            if not row.empty:
+                motion = float(row[motion_col].iloc[0])
+                # Rough normalization. Tune the scale as needed.
+                # Higher motion -> lower alpha (more conservative)
+                norm = min(max(motion / 25.0, 0.0), 1.0)
+                base_alpha = max(0.15, 0.40 - norm * 0.25)
+
+    if policy in ('biased', 'motion_aware', 'motion_biased'):
+        return base_alpha
+
+    return 0.5
+
+
 def simulate_adaptive_policies(
     frames: list[np.ndarray],
     labels: np.ndarray,
@@ -175,21 +211,25 @@ def simulate_adaptive_policies(
     max_triples: int | None = None,
     random_state: int = 42,
     policy_smoothing_window: int = 5,
+    profiles: pd.DataFrame | None = None,
 ) -> dict:
     """
     Симулює адаптивну інтерполяцію: для кожного кластеру застосовується своя стратегія.
 
-    Підтримувані політики:
-      - 'linear'     : звичайний 0.5 blend (базова)
-      - 'hold'       : повторювати попередній кадр (консервативно для високого руху)
-      - 'biased'     : blend з alpha=0.35 (зсув до попереднього)
+    Підтримувані політики (покращена версія):
+      - 'linear'          : звичайний 0.5 blend
+      - 'hold'            : повторити попередній кадр
+      - 'conservative'    : фіксований консервативний blend (alpha=0.25)
+      - 'biased'          : motion-dependent alpha (чим вищий рух — тим консервативніше)
+      - 'motion_aware'    : синонім до покращеного biased
+      - 'forward_biased'  : alpha ~0.65 (зсув до наступного кадру)
 
-    Важливе покращення:
-    - Використовується temporal smoothing (majority label у вікні) при виборі політики для позиції.
-      Це робить застосування політик більш "сегментним", а не хаотичним покадрово.
-    - Додатково обчислюється SSIM як вторинна метрика (окрім PSNR).
+    Ключові покращення:
+    - Alpha тепер залежить від профілю кластера (рух) для 'biased'/'motion_aware'.
+    - Temporal smoothing для стабільності застосування політик.
+    - Додатковий SSIM.
 
-    Повертає словник з метриками, таблицями та прикламами для візуалізації.
+    Повертає словник з метриками...
     """
     n = len(frames)
     if n < 3:
@@ -212,7 +252,7 @@ def simulate_adaptive_policies(
 
     for i in positions:
         cl = int(labels[i])
-        # Use smoothed policy decision (segment-aware)
+        # Segment-aware policy
         policy = _get_smoothed_policy(labels, i, policy_map, window=policy_smoothing_window)
 
         left = frames[i - 1]
@@ -224,13 +264,12 @@ def simulate_adaptive_policies(
         psnr_u = calculate_psnr(est_u, gt)
         ssim_u = calculate_ssim(est_u, gt)
 
-        # adaptive
+        # adaptive with improved alpha logic
+        alpha = _get_blend_alpha(cl, policy, profiles)
         if policy == 'hold':
             est_a = left.copy()
-        elif policy == 'biased':
-            est_a = _blend_pair(left, right, 0.35)
-        else:  # linear or unknown
-            est_a = _blend_pair(left, right, 0.5)
+        else:
+            est_a = _blend_pair(left, right, alpha)
 
         psnr_a = calculate_psnr(est_a, gt)
         ssim_a = calculate_ssim(est_a, gt)
@@ -247,7 +286,6 @@ def simulate_adaptive_policies(
         per_cluster_stats[cl]['u_ssim'].append(ssim_u)
         per_cluster_stats[cl]['a_ssim'].append(ssim_a)
 
-        # Збираємо приклади для найгірших позицій
         if len(examples) < 6:
             examples.append({
                 'position': i,
@@ -271,7 +309,6 @@ def simulate_adaptive_policies(
     overall_a_ssim = float(np.mean(adaptive_ssims)) if adaptive_ssims else 0.0
     delta_ssim = round(overall_a_ssim - overall_u_ssim, 4)
 
-    # per cluster table (now includes SSIM)
     rows = []
     for cl, d in per_cluster_stats.items():
         mu_p = float(np.mean(d['u_psnr']))
@@ -397,7 +434,8 @@ def recommend_policies_from_profiles(
         policy_map: dict[int, str] = {}
         all_cls = [int(row['cluster']) for _, row in work.iterrows()]
         for cl in all_cls:
-            cands = ["hold", "biased", "linear"] if cl in hard_clusters else ["biased", "linear"]
+            # Hard clusters can use hold or the smarter conservative/biased
+            cands = ["hold", "conservative", "biased", "linear"] if cl in hard_clusters else ["conservative", "biased", "linear"]
             if cl in psnr_means:
                 best = max(cands, key=lambda p: psnr_means[cl].get(p, -1e9))
             else:
@@ -420,7 +458,7 @@ def recommend_policies_from_profiles(
         elif score >= biased_thresh:
             policy = 'biased'
         else:
-            policy = 'linear'
+            policy = 'conservative' if score > (hold_thresh + biased_thresh) / 2 else 'linear'
         policy_map[cl] = policy
     return policy_map
 

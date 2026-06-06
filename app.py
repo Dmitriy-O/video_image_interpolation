@@ -46,7 +46,7 @@ DEFAULT_FEATURES = [
     "motion_mean", "motion_std",
 ]
 
-POLICY_OPTIONS = ["linear", "hold", "biased"]
+POLICY_OPTIONS = ["linear", "hold", "conservative", "biased", "motion_aware", "forward_biased"]
 
 APP_CSS = """
 /* ——— ноутбук: 1024px – 1600px ——— */
@@ -70,10 +70,10 @@ APP_CSS = """
 
 .gradio-container {
     min-width: 1024px !important;
-    max-width: 1320px !important;
+    max-width: 1280px !important;
     width: calc(100vw - 48px) !important;
     margin: 0 auto !important;
-    padding: 0 8px 32px !important;
+    padding: 0 8px 20px !important;
     background: linear-gradient(180deg, #f5f7fb 0%, #eef1f8 50%, #f3f5fa 100%) !important;
     font-family: "Segoe UI", system-ui, -apple-system, sans-serif !important;
 }
@@ -81,39 +81,39 @@ APP_CSS = """
 .app-hero {
     display: flex;
     align-items: center;
-    gap: 1.25rem;
-    padding: 1.5rem 0.5rem 1.25rem;
-    border-bottom: 1px solid rgba(148, 163, 184, 0.25);
-    margin-bottom: 1.25rem;
+    gap: 1rem;
+    padding: 1rem 0.4rem 0.85rem;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+    margin-bottom: 0.85rem;
 }
 .app-hero .mark {
-    width: 44px;
-    height: 44px;
-    border-radius: 12px;
+    width: 38px;
+    height: 38px;
+    border-radius: 10px;
     background: linear-gradient(145deg, #5b8def 0%, #7c9cf5 100%);
-    box-shadow: 0 6px 20px rgba(91, 141, 239, 0.35);
+    box-shadow: 0 4px 14px rgba(91, 141, 239, 0.3);
     flex-shrink: 0;
 }
 .app-hero h1 {
     margin: 0;
-    font-size: 1.55rem;
+    font-size: 1.4rem;
     font-weight: 600;
-    letter-spacing: -0.02em;
+    letter-spacing: -0.01em;
     color: #1e293b;
 }
 .app-hero .subtitle {
-    margin: 0.2rem 0 0;
-    font-size: 0.88rem;
+    margin: 0.1rem 0 0;
+    font-size: 0.8rem;
     color: #64748b;
 }
 
 .panel-card {
-    background: rgba(255, 255, 255, 0.92) !important;
-    border: 1px solid rgba(226, 232, 240, 0.9) !important;
-    border-radius: 16px !important;
-    box-shadow: 0 8px 32px rgba(30, 41, 59, 0.07) !important;
-    padding: 1.25rem 1.35rem !important;
-    backdrop-filter: blur(8px);
+    background: rgba(255, 255, 255, 0.95) !important;
+    border: 1px solid rgba(226, 232, 240, 0.85) !important;
+    border-radius: 14px !important;
+    box-shadow: 0 6px 24px rgba(30, 41, 59, 0.06) !important;
+    padding: 1rem 1.1rem !important;
+    backdrop-filter: blur(6px);
 }
 .panel-card h5, .panel-card .prose h5 {
     margin-top: 0 !important;
@@ -123,11 +123,11 @@ APP_CSS = """
 
 .workspace-card {
     background: #ffffff !important;
-    border-radius: 16px !important;
+    border-radius: 14px !important;
     border: 1px solid #e8ecf4 !important;
-    box-shadow: 0 10px 40px rgba(30, 41, 59, 0.06) !important;
-    padding: 1rem 1.15rem 1.25rem !important;
-    margin-top: 0.5rem !important;
+    box-shadow: 0 8px 28px rgba(30, 41, 59, 0.05) !important;
+    padding: 0.85rem 1rem 1rem !important;
+    margin-top: 0.35rem !important;
 }
 
 .results-strip {
@@ -449,7 +449,8 @@ def run_simulation(
     sim = simulate_adaptive_policies(
         frames, ward_labels, policies,
         sample_step=step, random_state=seed,
-        # policy_smoothing_window=5  # makes application more segment-like (default)
+        profiles=ctx.get("profiles"),   # enables motion-dependent alpha for biased/motion_aware
+        # policy_smoothing_window=5
     )
 
     fig = plot_policy_comparison(sim["per_cluster"])
@@ -527,20 +528,9 @@ def build_interface() -> gr.Blocks:
                     <div class="mark"></div>
                     <div>
                         <h1>Адаптивна інтерполяція відео</h1>
-                        <p class="subtitle">Model-based кластеризація відеокадрів</p>
+                        <p class="subtitle">Кластеризація контенту та адаптивні стратегії</p>
                     </div>
                 </div>
-                """
-            )
-
-            # === Кроки використання (для зрозумілішого дизайну) ===
-            gr.Markdown(
-                """
-                ### Як користуватися (4 прості кроки)
-                1. **Завантажте відео** (у лівому полі). Відео повинно мати принаймні 12 кадрів.
-                2. **Налаштуйте параметри** (праворуч) — дивіться пояснення нижче.
-                3. Натисніть **«Запустити аналіз»**.
-                4. Перегляньте результати у вкладках → перейдіть у **«Стратегії»**, натисніть **«Рекомендувати»** → **«Порівняти»**.
                 """
             )
 
@@ -551,26 +541,16 @@ def build_interface() -> gr.Blocks:
                     gr.Markdown("##### Параметри аналізу")
 
                     with gr.Row():
-                        n_clusters = gr.Slider(2, 6, value=4, step=1, label="Кластерів (k)", info="Скільки різних типів контенту виділяти (рекомендовано 3-4)")
-                        n_bins = gr.Slider(3, 8, value=5, step=1, label="Біни KModes", info="Грубість дискретизації для KModes (5 — хороший баланс)")
+                        n_clusters = gr.Slider(2, 6, value=4, step=1, label="Кластерів (k)")
+                        n_bins = gr.Slider(3, 8, value=5, step=1, label="Біни KModes")
 
                     with gr.Row():
-                        use_motion = gr.Checkbox(value=True, label="Ознаки руху", info="Враховувати рух між сусідніми кадрами (майже завжди вмикайте)")
-                        random_seed = gr.Number(value=42, label="Seed", precision=0, info="Фіксоване зерно для відтворюваності результатів")
+                        use_motion = gr.Checkbox(value=True, label="Ознаки руху")
+                        random_seed = gr.Number(value=42, label="Seed", precision=0)
 
                     with gr.Row():
-                        max_frames = gr.Slider(60, 600, value=300, step=30, label="Макс. кадрів", info="Скільки кадрів брати з відео (більше = точніше, але повільніше)")
-                        sample_step = gr.Slider(1, 5, value=2, step=1, label="Крок PSNR", info="Крок при оцінці якості (1 = найточніше, 2-3 = швидше)")
-
-                    gr.Markdown(
-                        """
-                        **Короткі поради по параметрах:**
-                        - Почніть з дефолтних значень.
-                        - Якщо хочете побачити сильніший ефект адаптації — поставте **Крок PSNR = 1** і збільшіть «Макс. кадрів».
-                        - Змінюйте **k** і Seed, щоб подивитись різні розбиття.
-                        - Більше деталей про вплив параметрів — у вкладці **«Методологія»**.
-                        """
-                    )
+                        max_frames = gr.Slider(60, 600, value=300, step=30, label="Макс. кадрів")
+                        sample_step = gr.Slider(1, 5, value=2, step=1, label="Крок PSNR")
 
                     process_btn = gr.Button("Запустити аналіз", variant="primary", size="lg")
 
@@ -609,11 +589,6 @@ def build_interface() -> gr.Blocks:
                                 )
 
                     with gr.Tab("Якість"):
-                        gr.Markdown(
-                            "Тут показано, наскільки добре працює **звичайна лінійна інтерполяція** для кожного кластера. "
-                            "Чим нижчий «Середній PSNR (temporal)» — тим «важчий» цей тип контенту для стандартної інтерполяції. "
-                            "Саме ці кластери варто спробувати обробляти за допомогою `hold` або `biased`."
-                        )
                         with gr.Row():
                             with gr.Column(scale=4):
                                 temporal_table = gr.Dataframe(
@@ -623,15 +598,6 @@ def build_interface() -> gr.Blocks:
                                 temporal_plot = gr.Plot(label="PSNR по кластерах")
 
                     with gr.Tab("Стратегії"):
-                        gr.Markdown(
-                            """
-                            **Як працювати з цією вкладкою:**
-                            1. Перегляньте спочатку вкладку **«Якість»** — там видно, які кластери мають найгіршу якість звичайної лінійної інтерполяції.
-                            2. Натисніть **«Рекомендувати»** — застосунок розумно підбере політики (з урахуванням ваших кластерів).
-                            3. За потреби відредагуйте таблицю вручну.
-                            4. Натисніть **«Порівняти»**, щоб побачити, чи дає обрана стратегія покращення (Δ PSNR та Δ SSIM).
-                            """
-                        )
                         with gr.Row():
                             with gr.Column(scale=4):
                                 policy_table = gr.Dataframe(
@@ -658,14 +624,8 @@ def build_interface() -> gr.Blocks:
                             | Ознаки | BGR, яскравість, контраст, Laplacian, різниця кадрів |
                             | Кластеризація | Ward (неперервні) · KModes (дискретні) |
                             | Валідація | ARI, NMI між розбиттями |
-                            | Оцінка | Temporal triplets → PSNR до ground truth |
-                            | Адаптація | `linear` · `hold` · `biased` per cluster |
-                            """
-                        )
-                        gr.Markdown(
-                            """
-                            **Для помітного ефекту адаптації** обирайте відео з чіткими фазами (спокій → різкий рух / старт-стоп, кидки, підстрибування, паузи в дії). 
-                            Ставте **Крок PSNR = 1** і більший Max. кадрів. Дивіться різницю «Середній PSNR (temporal)» між кластерами у вкладці «Якість».
+                            | Оцінка | Temporal triplets → PSNR + SSIM |
+                            | Адаптація | `linear`, `conservative`, `biased` (motion-aware), `hold`, `motion_aware`, `forward_biased` |
                             """
                         )
 
