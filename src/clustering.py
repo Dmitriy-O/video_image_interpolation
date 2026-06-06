@@ -95,59 +95,45 @@ def recommend_policies_from_features(
     feature_df: pd.DataFrame,
     labels: np.ndarray,
     *,
-    hold_quantile: float = 0.80,
-    biased_quantile: float = 0.50,
+    hold_motion_quantile: float = 0.85,      # Тільки дуже високий рух
+    hold_texture_quantile: float = 0.85,
+    biased_motion_quantile: float = 0.55,    # Середній рівень
+    biased_texture_quantile: float = 0.55
 ) -> dict[int, str]:
     """
-    Зручна обгортка: будує профілі і рекомендує політики.
-
-    Використовує комбінований скор (рух + текстура одночасно).
-    'hold' — тільки топ ~20-25% (quantile 0.80 за замовчуванням) найскладніших кластерів.
-    Інші: 'biased' (вище медіани) або 'linear'.
-
-    Це узгоджено з recommend_policies_from_profiles (виправлення проблеми,
-    коли рекомендація давала гірший результат за baseline).
+    Покращена версія рекомендації політик.
+    hold     — для найскладніших кластерів
+    biased   — для середньо-складних
+    linear   — для простих
     """
     prof = compute_cluster_profiles(feature_df, labels)
     if prof.empty:
         return {}
 
-    # Знаходимо колонки з середніми значеннями
-    motion_col = next((c for c in prof.columns if 'motion_mean' in c and '_mean' in c), None)
-    texture_col = next((c for c in prof.columns if 'texture_laplacian' in c and '_mean' in c), None)
+    motion_col = next((c for c in prof.columns if 'motion_mean' in c), None)
+    texture_col = next((c for c in prof.columns if 'texture_laplacian' in c), None)
 
-    if motion_col is None or texture_col is None:
-        # fallback: все linear
-        return {int(row['cluster']): 'linear' for _, row in prof.iterrows()}
-
-    # Нормалізуємо
-    m = prof[motion_col]
-    t = prof[texture_col]
-    motion_norm = (m / m.max()) if m.max() > 0 else pd.Series([0.0] * len(prof))
-    texture_norm = (t / t.max()) if t.max() > 0 else pd.Series([0.0] * len(prof))
-
-    combined = (motion_norm + texture_norm) / 2.0
-    work = prof[['cluster']].reset_index(drop=True)
-    work['combined'] = combined.reset_index(drop=True)
-
-    n = len(work)
-    if n >= 2:
-        hold_thresh = float(work['combined'].quantile(hold_quantile))
-        biased_thresh = float(work['combined'].quantile(biased_quantile))
-    else:
-        hold_thresh = 0.85
-        biased_thresh = 0.5
-
-    policy_map: dict[int, str] = {}
-    for _, row in work.iterrows():
+    policy_map = {}
+    for _, row in prof.iterrows():
         cl = int(row['cluster'])
-        score = float(row['combined'])
-        if score >= hold_thresh:
+        
+        motion_val = row.get(motion_col, 0) if motion_col else 0
+        texture_val = row.get(texture_col, 0) if texture_col else 0
+
+        motion_thresh_hold = prof[motion_col].quantile(hold_motion_quantile) if motion_col else 0
+        texture_thresh_hold = prof[texture_col].quantile(hold_texture_quantile) if texture_col else 0
+
+        motion_thresh_biased = prof[motion_col].quantile(biased_motion_quantile) if motion_col else 0
+        texture_thresh_biased = prof[texture_col].quantile(biased_texture_quantile) if texture_col else 0
+
+        # Пріоритет: спочатку перевіряємо на hold
+        if (motion_val >= motion_thresh_hold) or (texture_val >= texture_thresh_hold):
             policy = 'hold'
-        elif score >= biased_thresh:
+        elif (motion_val >= motion_thresh_biased) or (texture_val >= texture_thresh_biased):
             policy = 'biased'
         else:
             policy = 'linear'
+
         policy_map[cl] = policy
 
     return policy_map

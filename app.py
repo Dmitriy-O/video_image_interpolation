@@ -449,24 +449,45 @@ def run_simulation(
     sim = simulate_adaptive_policies(
         frames, ward_labels, policies,
         sample_step=step, random_state=seed,
+        # policy_smoothing_window=5  # makes application more segment-like (default)
     )
 
     fig = plot_policy_comparison(sim["per_cluster"])
     delta_color = "#166534" if sim["delta"] >= 0 else "#991b1b"
+    delta_ssim_color = "#166534" if sim.get("delta_ssim", 0) >= 0 else "#991b1b"
+
     text = f"""
     <div class="metrics-bar">
         <div class="metric-chip">
-            <div class="label">Базова</div>
+            <div class="label">Базова (PSNR)</div>
             <div class="value">{sim['overall_uniform']:.2f} dB</div>
         </div>
         <div class="metric-chip">
-            <div class="label">Адаптивна</div>
+            <div class="label">Адаптивна (PSNR)</div>
             <div class="value">{sim['overall_adaptive']:.2f} dB</div>
         </div>
         <div class="metric-chip">
             <div class="label">Δ PSNR</div>
             <div class="value" style="color:{delta_color}">{sim['delta']:+.2f} dB</div>
         </div>
+    </div>
+    <div class="metrics-bar" style="margin-top: 8px;">
+        <div class="metric-chip">
+            <div class="label">Базова (SSIM)</div>
+            <div class="value">{sim.get('overall_uniform_ssim', 0):.4f}</div>
+        </div>
+        <div class="metric-chip">
+            <div class="label">Адаптивна (SSIM)</div>
+            <div class="value">{sim.get('overall_adaptive_ssim', 0):.4f}</div>
+        </div>
+        <div class="metric-chip">
+            <div class="label">Δ SSIM</div>
+            <div class="value" style="color:{delta_ssim_color}">{sim.get('delta_ssim', 0):+.4f}</div>
+        </div>
+    </div>
+    <div style="font-size:0.8rem; color:#64748b; margin-top:4px;">
+        SSIM — додаткова метрика структурної подібності (вторинна до PSNR). 
+        Політики застосовуються з temporal smoothing (сегментний режим) для зменшення хаотичних перемикань.
     </div>
     """
 
@@ -512,20 +533,45 @@ def build_interface() -> gr.Blocks:
                 """
             )
 
+            # === Кроки використання (для зрозумілішого дизайну) ===
+            gr.Markdown(
+                """
+                ### Як користуватися (4 прості кроки)
+                1. **Завантажте відео** (у лівому полі). Відео повинно мати принаймні 12 кадрів.
+                2. **Налаштуйте параметри** (праворуч) — дивіться пояснення нижче.
+                3. Натисніть **«Запустити аналіз»**.
+                4. Перегляньте результати у вкладках → перейдіть у **«Стратегії»**, натисніть **«Рекомендувати»** → **«Порівняти»**.
+                """
+            )
+
             with gr.Row(equal_height=True):
                 with gr.Column(scale=5):
                     video_in = gr.Video(label="Відеозапис", height=220)
                 with gr.Column(scale=6, elem_classes=["panel-card"]):
                     gr.Markdown("##### Параметри аналізу")
+
                     with gr.Row():
-                        n_clusters = gr.Slider(2, 6, value=4, step=1, label="Кластерів (k)")
-                        n_bins = gr.Slider(3, 8, value=5, step=1, label="Біни KModes")
+                        n_clusters = gr.Slider(2, 6, value=4, step=1, label="Кластерів (k)", info="Скільки різних типів контенту виділяти (рекомендовано 3-4)")
+                        n_bins = gr.Slider(3, 8, value=5, step=1, label="Біни KModes", info="Грубість дискретизації для KModes (5 — хороший баланс)")
+
                     with gr.Row():
-                        use_motion = gr.Checkbox(value=True, label="Ознаки руху")
-                        random_seed = gr.Number(value=42, label="Seed", precision=0)
+                        use_motion = gr.Checkbox(value=True, label="Ознаки руху", info="Враховувати рух між сусідніми кадрами (майже завжди вмикайте)")
+                        random_seed = gr.Number(value=42, label="Seed", precision=0, info="Фіксоване зерно для відтворюваності результатів")
+
                     with gr.Row():
-                        max_frames = gr.Slider(60, 600, value=300, step=30, label="Макс. кадрів")
-                        sample_step = gr.Slider(1, 5, value=2, step=1, label="Крок PSNR")
+                        max_frames = gr.Slider(60, 600, value=300, step=30, label="Макс. кадрів", info="Скільки кадрів брати з відео (більше = точніше, але повільніше)")
+                        sample_step = gr.Slider(1, 5, value=2, step=1, label="Крок PSNR", info="Крок при оцінці якості (1 = найточніше, 2-3 = швидше)")
+
+                    gr.Markdown(
+                        """
+                        **Короткі поради по параметрах:**
+                        - Почніть з дефолтних значень.
+                        - Якщо хочете побачити сильніший ефект адаптації — поставте **Крок PSNR = 1** і збільшіть «Макс. кадрів».
+                        - Змінюйте **k** і Seed, щоб подивитись різні розбиття.
+                        - Більше деталей про вплив параметрів — у вкладці **«Методологія»**.
+                        """
+                    )
+
                     process_btn = gr.Button("Запустити аналіз", variant="primary", size="lg")
 
             with gr.Row(elem_classes=["results-strip"]):
@@ -563,6 +609,11 @@ def build_interface() -> gr.Blocks:
                                 )
 
                     with gr.Tab("Якість"):
+                        gr.Markdown(
+                            "Тут показано, наскільки добре працює **звичайна лінійна інтерполяція** для кожного кластера. "
+                            "Чим нижчий «Середній PSNR (temporal)» — тим «важчий» цей тип контенту для стандартної інтерполяції. "
+                            "Саме ці кластери варто спробувати обробляти за допомогою `hold` або `biased`."
+                        )
                         with gr.Row():
                             with gr.Column(scale=4):
                                 temporal_table = gr.Dataframe(
@@ -572,6 +623,15 @@ def build_interface() -> gr.Blocks:
                                 temporal_plot = gr.Plot(label="PSNR по кластерах")
 
                     with gr.Tab("Стратегії"):
+                        gr.Markdown(
+                            """
+                            **Як працювати з цією вкладкою:**
+                            1. Перегляньте спочатку вкладку **«Якість»** — там видно, які кластери мають найгіршу якість звичайної лінійної інтерполяції.
+                            2. Натисніть **«Рекомендувати»** — застосунок розумно підбере політики (з урахуванням ваших кластерів).
+                            3. За потреби відредагуйте таблицю вручну.
+                            4. Натисніть **«Порівняти»**, щоб побачити, чи дає обрана стратегія покращення (Δ PSNR та Δ SSIM).
+                            """
+                        )
                         with gr.Row():
                             with gr.Column(scale=4):
                                 policy_table = gr.Dataframe(
@@ -600,6 +660,12 @@ def build_interface() -> gr.Blocks:
                             | Валідація | ARI, NMI між розбиттями |
                             | Оцінка | Temporal triplets → PSNR до ground truth |
                             | Адаптація | `linear` · `hold` · `biased` per cluster |
+                            """
+                        )
+                        gr.Markdown(
+                            """
+                            **Для помітного ефекту адаптації** обирайте відео з чіткими фазами (спокій → різкий рух / старт-стоп, кидки, підстрибування, паузи в дії). 
+                            Ставте **Крок PSNR = 1** і більший Max. кадрів. Дивіться різницю «Середній PSNR (temporal)» між кластерами у вкладці «Якість».
                             """
                         )
 

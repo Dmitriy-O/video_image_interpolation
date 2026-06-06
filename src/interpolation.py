@@ -19,6 +19,33 @@ def calculate_psnr(img1: np.ndarray, img2: np.ndarray) -> float:
     return 20 * np.log10(255.0 / np.sqrt(mse))
 
 
+def calculate_ssim(img1: np.ndarray, img2: np.ndarray) -> float:
+    """Simple global SSIM (for relative comparison and secondary metric in the demo).
+
+    Not a full local-window SSIM, but sufficient to show structural differences
+    beyond pure pixel MSE/PSNR.
+    """
+    if img1.shape != img2.shape:
+        return 0.0
+    img1 = img1.astype(np.float64)
+    img2 = img2.astype(np.float64)
+
+    C1 = (0.01 * 255) ** 2
+    C2 = (0.03 * 255) ** 2
+
+    mu1 = np.mean(img1)
+    mu2 = np.mean(img2)
+    sigma1_sq = np.var(img1)
+    sigma2_sq = np.var(img2)
+    sigma12 = np.mean((img1 - mu1) * (img2 - mu2))
+
+    numerator = (2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)
+    denominator = (mu1 ** 2 + mu2 ** 2 + C1) * (sigma1_sq + sigma2_sq + C2)
+    if denominator == 0:
+        return 0.0
+    return float(numerator / denominator)
+
+
 def evaluate_interpolation_on_clusters(frames, labels, n_samples_per_cluster=5, random_state: int = 42):
     """Стара (не рекомендована) оцінка — використовуйте compute_temporal... для наукової коректності."""
     rng = np.random.default_rng(random_state)
@@ -123,6 +150,22 @@ def compute_temporal_interp_errors(
     return detailed, summary
 
 
+def _get_smoothed_policy(labels: np.ndarray, i: int, policy_map: dict[int, str], window: int = 5) -> str:
+    """Return the policy according to the majority cluster label in a temporal window around i.
+
+    This makes policy application more 'segment-like' instead of flipping chaotically
+    on every individual frame label (addresses one of the main weaknesses of per-frame clustering).
+    """
+    start = max(0, i - window // 2)
+    end = min(len(labels), i + window // 2 + 1)
+    window_labels = labels[start:end].astype(int)
+    if len(window_labels) == 0:
+        maj = int(labels[i])
+    else:
+        maj = int(np.bincount(window_labels).argmax())
+    return policy_map.get(maj, 'linear')
+
+
 def simulate_adaptive_policies(
     frames: list[np.ndarray],
     labels: np.ndarray,
@@ -130,7 +173,8 @@ def simulate_adaptive_policies(
     *,
     sample_step: int = 2,
     max_triples: int | None = None,
-    random_state: int = 42
+    random_state: int = 42,
+    policy_smoothing_window: int = 5,
 ) -> dict:
     """
     Симулює адаптивну інтерполяцію: для кожного кластеру застосовується своя стратегія.
@@ -140,16 +184,24 @@ def simulate_adaptive_policies(
       - 'hold'       : повторювати попередній кадр (консервативно для високого руху)
       - 'biased'     : blend з alpha=0.35 (зсув до попереднього)
 
-    Повертає словник з метриками, таблицями та прикладами для візуалізації.
+    Важливе покращення:
+    - Використовується temporal smoothing (majority label у вікні) при виборі політики для позиції.
+      Це робить застосування політик більш "сегментним", а не хаотичним покадрово.
+    - Додатково обчислюється SSIM як вторинна метрика (окрім PSNR).
+
+    Повертає словник з метриками, таблицями та прикламами для візуалізації.
     """
     n = len(frames)
     if n < 3:
         return {'overall_uniform': 0.0, 'overall_adaptive': 0.0, 'delta': 0.0,
+                'overall_uniform_ssim': 0.0, 'overall_adaptive_ssim': 0.0, 'delta_ssim': 0.0,
                 'per_cluster': pd.DataFrame(), 'examples': []}
 
     rng = np.random.default_rng(random_state)
     uniform_psnrs = []
     adaptive_psnrs = []
+    uniform_ssims = []
+    adaptive_ssims = []
     per_cluster_stats = {}
     examples = []
 
@@ -160,7 +212,8 @@ def simulate_adaptive_policies(
 
     for i in positions:
         cl = int(labels[i])
-        policy = policy_map.get(cl, 'linear')
+        # Use smoothed policy decision (segment-aware)
+        policy = _get_smoothed_policy(labels, i, policy_map, window=policy_smoothing_window)
 
         left = frames[i - 1]
         right = frames[i + 1]
@@ -169,6 +222,7 @@ def simulate_adaptive_policies(
         # uniform baseline
         est_u = _blend_pair(left, right, 0.5)
         psnr_u = calculate_psnr(est_u, gt)
+        ssim_u = calculate_ssim(est_u, gt)
 
         # adaptive
         if policy == 'hold':
@@ -179,17 +233,22 @@ def simulate_adaptive_policies(
             est_a = _blend_pair(left, right, 0.5)
 
         psnr_a = calculate_psnr(est_a, gt)
+        ssim_a = calculate_ssim(est_a, gt)
 
         uniform_psnrs.append(psnr_u)
         adaptive_psnrs.append(psnr_a)
+        uniform_ssims.append(ssim_u)
+        adaptive_ssims.append(ssim_a)
 
         if cl not in per_cluster_stats:
-            per_cluster_stats[cl] = {'u': [], 'a': []}
-        per_cluster_stats[cl]['u'].append(psnr_u)
-        per_cluster_stats[cl]['a'].append(psnr_a)
+            per_cluster_stats[cl] = {'u_psnr': [], 'a_psnr': [], 'u_ssim': [], 'a_ssim': []}
+        per_cluster_stats[cl]['u_psnr'].append(psnr_u)
+        per_cluster_stats[cl]['a_psnr'].append(psnr_a)
+        per_cluster_stats[cl]['u_ssim'].append(ssim_u)
+        per_cluster_stats[cl]['a_ssim'].append(ssim_a)
 
-        # Збираємо приклади для найгірших позицій (пізніше фільтруємо в app)
-        if len(examples) < 6:  # обмежуємо
+        # Збираємо приклади для найгірших позицій
+        if len(examples) < 6:
             examples.append({
                 'position': i,
                 'cluster': cl,
@@ -200,35 +259,48 @@ def simulate_adaptive_policies(
                 'adaptive': est_a,
                 'psnr_uniform': round(psnr_u, 2),
                 'psnr_adaptive': round(psnr_a, 2),
+                'ssim_uniform': round(ssim_u, 4),
+                'ssim_adaptive': round(ssim_a, 4),
             })
 
     overall_u = float(np.mean(uniform_psnrs)) if uniform_psnrs else 0.0
     overall_a = float(np.mean(adaptive_psnrs)) if adaptive_psnrs else 0.0
     delta = round(overall_a - overall_u, 2)
 
-    # per cluster table
+    overall_u_ssim = float(np.mean(uniform_ssims)) if uniform_ssims else 0.0
+    overall_a_ssim = float(np.mean(adaptive_ssims)) if adaptive_ssims else 0.0
+    delta_ssim = round(overall_a_ssim - overall_u_ssim, 4)
+
+    # per cluster table (now includes SSIM)
     rows = []
     for cl, d in per_cluster_stats.items():
-        mu = float(np.mean(d['u']))
-        ma = float(np.mean(d['a']))
+        mu_p = float(np.mean(d['u_psnr']))
+        ma_p = float(np.mean(d['a_psnr']))
+        mu_s = float(np.mean(d['u_ssim']))
+        ma_s = float(np.mean(d['a_ssim']))
         rows.append({
             'Кластер': cl,
-            'Uniform PSNR': round(mu, 2),
-            'Adaptive PSNR': round(ma, 2),
-            'Δ (підйом)': round(ma - mu, 2),
+            'Uniform PSNR': round(mu_p, 2),
+            'Adaptive PSNR': round(ma_p, 2),
+            'Δ PSNR': round(ma_p - mu_p, 2),
+            'Uniform SSIM': round(mu_s, 4),
+            'Adaptive SSIM': round(ma_s, 4),
+            'Δ SSIM': round(ma_s - mu_s, 4),
             'Політика': policy_map.get(cl, 'linear')
         })
     per_cluster_df = pd.DataFrame(rows)
 
-    # Приклади — відсортуємо за найбільшим локальним підйомом
     examples.sort(key=lambda e: e['psnr_adaptive'] - e['psnr_uniform'], reverse=True)
 
     return {
         'overall_uniform': round(overall_u, 2),
         'overall_adaptive': round(overall_a, 2),
         'delta': delta,
+        'overall_uniform_ssim': round(overall_u_ssim, 4),
+        'overall_adaptive_ssim': round(overall_a_ssim, 4),
+        'delta_ssim': delta_ssim,
         'per_cluster': per_cluster_df,
-        'examples': examples[:4],  # топ-4 для UI
+        'examples': examples[:4],
         'n_samples': len(uniform_psnrs)
     }
 
@@ -351,6 +423,10 @@ def recommend_policies_from_profiles(
             policy = 'linear'
         policy_map[cl] = policy
     return policy_map
+
+
+# Small helper exposed for documentation / future UI
+POLICY_SMOOTHING_WINDOW_DEFAULT = 5
 
 
 def create_adaptive_reconstruction_demo(
