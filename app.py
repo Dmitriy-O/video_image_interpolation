@@ -414,7 +414,14 @@ def recommend_policies_ui(ctx: dict | None):
     raw_profiles = ctx.get("profiles")
     if raw_profiles is None or raw_profiles.empty:
         return pd.DataFrame(columns=["Кластер", "Стратегія"]), _status_html("Профілі недоступні.", error=True)
-    rec = recommend_policies_from_profiles(raw_profiles)
+
+    rec = recommend_policies_from_profiles(
+        raw_profiles,
+        frames=ctx.get("frames"),
+        labels=ctx.get("ward_labels"),
+        sample_step=ctx.get("sample_step", 2),
+        random_state=ctx.get("random_seed", 42),
+    )
     return _policies_to_df(rec), _status_html("Рекомендації застосовано.")
 
 

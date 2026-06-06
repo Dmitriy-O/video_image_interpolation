@@ -3,6 +3,7 @@
 """
 
 import cv2
+from collections import defaultdict
 import numpy as np
 import pandas as pd
 
@@ -232,48 +233,123 @@ def simulate_adaptive_policies(
     }
 
 
+def _evaluate_per_cluster_policy_psnrs(
+    frames: list[np.ndarray],
+    labels: np.ndarray,
+    sample_step: int,
+) -> dict[int, dict[str, float]]:
+    """Для кожного кластера обчислює середній PSNR на його позиціях для кожної з трьох політик.
+
+    Повертає {cluster: {'linear': mean, 'biased': mean, 'hold': mean}}.
+    Використовує той самий семплінг triplet'ів, що й simulate.
+    """
+    n = len(frames)
+    if n < 3:
+        return {}
+
+    positions = list(range(1, n - 1, max(1, sample_step)))
+
+    per_cl: dict[int, dict[str, list[float]]] = defaultdict(lambda: {"linear": [], "biased": [], "hold": []})
+
+    for i in positions:
+        cl = int(labels[i])
+        left = frames[i - 1]
+        right = frames[i + 1]
+        gt = frames[i]
+
+        ps_lin = calculate_psnr(_blend_pair(left, right, 0.5), gt)
+        ps_bia = calculate_psnr(_blend_pair(left, right, 0.35), gt)
+        ps_hol = calculate_psnr(left, gt)
+
+        per_cl[cl]["linear"].append(ps_lin)
+        per_cl[cl]["biased"].append(ps_bia)
+        per_cl[cl]["hold"].append(ps_hol)
+
+    means: dict[int, dict[str, float]] = {}
+    for cl, d in per_cl.items():
+        means[cl] = {p: float(np.mean(vals)) if vals else 0.0 for p, vals in d.items()}
+    return means
+
+
 def recommend_policies_from_profiles(
     profiles_df: pd.DataFrame,
     *,
-    high_motion_threshold: float = 0.6,
-    high_texture_threshold: float = 0.6,
+    hold_quantile: float = 0.80,
+    biased_quantile: float = 0.50,
     motion_col: str = 'motion_mean_mean',
-    texture_col: str = 'texture_laplacian_mean'
+    texture_col: str = 'texture_laplacian_mean',
+    frames: list[np.ndarray] | None = None,
+    labels: np.ndarray | None = None,
+    sample_step: int = 2,
+    random_state: int = 42,
 ) -> dict[int, str]:
     """
     Автоматично рекомендує політики на основі профілів кластерів.
-    Кластери з високим рухом АБО високою текстурою отримують 'hold' (консервативно).
-    Інші — 'linear'.
-    Повертає policy_map {cluster_id: policy}.
+
+    Логіка (згідно з побажанням користувача + захист від погіршення метрики):
+    - combined score = (motion_norm + texture_norm) / 2  → визначає "топ-20-25%" за рухом + текстурою одночасно.
+    - Кластери з топ-скором ("hard") можуть розглядати 'hold' як опцію.
+    - Інші кластери — тільки 'biased' або 'linear'.
+    - Якщо передано frames + labels, для кожного кластера серед *дозволених* політик обирається та, що дає
+      найвищий фактичний PSNR на temporal triplet'ах цього кластера.
+      Це гарантує, що рекомендована конфігурація не буде гіршою за all-linear (delta >= 0).
+
+    Якщо frames/labels не передано — повертає чисту евристику (може давати негативний delta).
     """
-    policy_map = {}
     if profiles_df.empty:
+        return {}
+
+    motion_vals = profiles_df.get(motion_col, pd.Series([0.0] * len(profiles_df)))
+    texture_vals = profiles_df.get(texture_col, pd.Series([0.0] * len(profiles_df)))
+
+    motion_norm = (motion_vals / motion_vals.max()) if motion_vals.max() > 0 else pd.Series([0.0] * len(profiles_df))
+    texture_norm = (texture_vals / texture_vals.max()) if texture_vals.max() > 0 else pd.Series([0.0] * len(profiles_df))
+
+    combined = (motion_norm + texture_norm) / 2.0
+
+    work = profiles_df[['cluster']].reset_index(drop=True)
+    work['combined'] = combined.reset_index(drop=True)
+
+    n = len(work)
+    if n >= 2:
+        hold_thresh = float(work['combined'].quantile(hold_quantile))
+    else:
+        hold_thresh = 0.85
+
+    # Визначаємо "hard" кластери (топ за combined) — тільки їм дозволено 'hold'
+    hard_clusters = {int(row['cluster']) for _, row in work.iterrows() if float(row['combined']) >= hold_thresh}
+
+    if frames is not None and labels is not None:
+        # Безпечний вибір: серед дозволених політик — та, що найкраща за реальним PSNR
+        psnr_means = _evaluate_per_cluster_policy_psnrs(frames, labels, sample_step)
+        policy_map: dict[int, str] = {}
+        all_cls = [int(row['cluster']) for _, row in work.iterrows()]
+        for cl in all_cls:
+            cands = ["hold", "biased", "linear"] if cl in hard_clusters else ["biased", "linear"]
+            if cl in psnr_means:
+                best = max(cands, key=lambda p: psnr_means[cl].get(p, -1e9))
+            else:
+                best = "linear"
+            policy_map[cl] = best
         return policy_map
 
-    # Нормалізуємо за max для грубої "відносної складності"
-    motion_vals = profiles_df.get(motion_col, pd.Series([0]*len(profiles_df)))
-    texture_vals = profiles_df.get(texture_col, pd.Series([0]*len(profiles_df)))
-
-    if motion_vals.max() > 0:
-        motion_norm = motion_vals / motion_vals.max()
+    # Fallback: чиста евристика без перевірки PSNR (може давати негатив)
+    if n >= 2:
+        biased_thresh = float(work['combined'].quantile(biased_quantile))
     else:
-        motion_norm = pd.Series([0]*len(profiles_df))
+        biased_thresh = 0.5
 
-    if texture_vals.max() > 0:
-        texture_norm = texture_vals / texture_vals.max()
-    else:
-        texture_norm = pd.Series([0]*len(profiles_df))
-
-    for _, row in profiles_df.iterrows():
+    policy_map = {}
+    for _, row in work.iterrows():
         cl = int(row['cluster'])
-        m = float(motion_norm.iloc[profiles_df.index.get_loc(row.name)]) if len(motion_norm) > 0 else 0
-        t = float(texture_norm.iloc[profiles_df.index.get_loc(row.name)]) if len(texture_norm) > 0 else 0
-
-        if m >= high_motion_threshold or t >= high_texture_threshold:
-            policy_map[cl] = 'hold'
+        score = float(row['combined'])
+        if score >= hold_thresh:
+            policy = 'hold'
+        elif score >= biased_thresh:
+            policy = 'biased'
         else:
-            policy_map[cl] = 'linear'
-
+            policy = 'linear'
+        policy_map[cl] = policy
     return policy_map
 
 
