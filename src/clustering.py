@@ -95,16 +95,15 @@ def recommend_policies_from_features(
     feature_df: pd.DataFrame,
     labels: np.ndarray,
     *,
-    hold_motion_quantile: float = 0.85,      # Тільки дуже високий рух
-    hold_texture_quantile: float = 0.85,
-    biased_motion_quantile: float = 0.55,    # Середній рівень
-    biased_texture_quantile: float = 0.55
+    hold_motion_quantile: float = 0.80,
+    hold_texture_quantile: float = 0.80,
+    biased_motion_quantile: float = 0.50,
+    biased_texture_quantile: float = 0.50
 ) -> dict[int, str]:
     """
-    Покращена версія рекомендації політик.
-    hold     — для найскладніших кластерів
-    biased   — для середньо-складних
-    linear   — для простих
+    Рекомендація політик.
+    hold / conservative — для складних кластерів
+    linear — стандарт для решти (коли не складно)
     """
     prof = compute_cluster_profiles(feature_df, labels)
     if prof.empty:
@@ -130,7 +129,7 @@ def recommend_policies_from_features(
         if (motion_val >= motion_thresh_hold) or (texture_val >= texture_thresh_hold):
             policy = 'hold'
         elif (motion_val >= motion_thresh_biased) or (texture_val >= texture_thresh_biased):
-            policy = 'biased'
+            policy = 'conservative'
         else:
             policy = 'linear'
 

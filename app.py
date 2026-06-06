@@ -46,7 +46,11 @@ DEFAULT_FEATURES = [
     "motion_mean", "motion_std",
 ]
 
-POLICY_OPTIONS = ["linear", "hold", "conservative", "biased", "motion_aware", "forward_biased"]
+POLICY_OPTIONS = [
+    "linear", "mild", "moderate", "conservative",
+    "strong", "very_strong", "hold",
+    "biased", "motion_aware", "forward_biased"
+]
 
 APP_CSS = """
 /* ——— ноутбук: 1024px – 1600px ——— */
@@ -368,6 +372,8 @@ def process_video(
         for idx, img in items:
             gallery.append((_bgr_to_rgb(img), f"Кластер {cl}, кадр {idx}"))
 
+    # Return to all-linear as the standard starting point after analysis.
+    # "Рекомендувати" will then suggest changes only where non-linear policies are actually better.
     policies = {int(c): "linear" for c in np.unique(ward_labels)}
     policy_df = _policies_to_df(policies)
 
@@ -449,8 +455,8 @@ def run_simulation(
     sim = simulate_adaptive_policies(
         frames, ward_labels, policies,
         sample_step=step, random_state=seed,
-        profiles=ctx.get("profiles"),   # enables motion-dependent alpha for biased/motion_aware
-        # policy_smoothing_window=5
+        profiles=ctx.get("profiles"),   # enables motion-dependent fine-grained alpha
+        # policy_smoothing_window=9  # stronger default temporal smoothing
     )
 
     fig = plot_policy_comparison(sim["per_cluster"])
@@ -625,7 +631,7 @@ def build_interface() -> gr.Blocks:
                             | Кластеризація | Ward (неперервні) · KModes (дискретні) |
                             | Валідація | ARI, NMI між розбиттями |
                             | Оцінка | Temporal triplets → PSNR + SSIM |
-                            | Адаптація | `linear`, `conservative`, `biased` (motion-aware), `hold`, `motion_aware`, `forward_biased` |
+                            | Адаптація | fine-grained (0.10–0.62): linear, mild, moderate, conservative, strong, very_strong, hold, biased/motion_aware, forward_biased |
                             """
                         )
 

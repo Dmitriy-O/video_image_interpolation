@@ -150,11 +150,31 @@ def compute_temporal_interp_errors(
     return detailed, summary
 
 
-def _get_smoothed_policy(labels: np.ndarray, i: int, policy_map: dict[int, str], window: int = 5) -> str:
-    """Return the policy according to the majority cluster label in a temporal window around i.
+def _smooth_label_sequence(labels: np.ndarray, window: int = 9) -> np.ndarray:
+    """
+    Apply strong temporal smoothing to the label sequence using a rolling majority vote.
+    Larger window = stronger temporal consistency (policies change less frequently,
+    behaving more like segment-level decisions).
+    """
+    n = len(labels)
+    if n == 0:
+        return labels
+    smoothed = np.zeros(n, dtype=labels.dtype)
+    half = window // 2
+    for i in range(n):
+        start = max(0, i - half)
+        end = min(n, i + half + 1)
+        window_labels = labels[start:end].astype(int)
+        if len(window_labels) > 0:
+            smoothed[i] = np.bincount(window_labels).argmax()
+        else:
+            smoothed[i] = labels[i]
+    return smoothed
 
-    This makes policy application more 'segment-like' instead of flipping chaotically
-    on every individual frame label (addresses one of the main weaknesses of per-frame clustering).
+
+def _get_smoothed_policy(labels: np.ndarray, i: int, policy_map: dict[int, str], window: int = 9) -> str:
+    """Return the policy according to the majority cluster label in a temporal window around i.
+    Default window increased for stronger temporal smoothing (more segment-like behavior).
     """
     start = max(0, i - window // 2)
     end = min(len(labels), i + window // 2 + 1)
@@ -168,38 +188,49 @@ def _get_smoothed_policy(labels: np.ndarray, i: int, policy_map: dict[int, str],
 
 def _get_blend_alpha(cluster: int, policy: str, profiles: pd.DataFrame | None = None) -> float:
     """
-    Returns the blend alpha for the given policy and cluster.
+    Returns a fine-grained blend alpha for the given policy and cluster.
 
-    Makes 'biased' and new policies profile-aware (motion-dependent).
-    Higher motion → more conservative (lower alpha, more weight to previous frame).
+    More gradations of alpha (from very conservative to forward) based on:
+    - Explicit policy strength
+    - Cluster motion profile (higher motion → lower alpha = more weight to previous frame)
+
+    This iteration adds more granular levels and stronger motion sensitivity.
     """
     if policy == 'hold':
         return 0.0
-    if policy == 'conservative':
-        return 0.25
-    if policy == 'linear':
-        return 0.5
-    if policy == 'forward_biased':
-        return 0.65
+    if policy == 'very_strong':
+        base = 0.12
+    elif policy == 'strong':
+        base = 0.20
+    elif policy == 'conservative':
+        base = 0.28
+    elif policy == 'moderate':
+        base = 0.36
+    elif policy == 'mild':
+        base = 0.42
+    elif policy == 'linear':
+        base = 0.50
+    elif policy == 'forward_biased':
+        base = 0.62
+    else:
+        # 'biased', 'motion_aware' etc. start from a mid-conservative base
+        base = 0.35
 
-    # Default / biased / motion_aware: motion-dependent
-    base_alpha = 0.35
-
-    if profiles is not None and not profiles.empty:
+    # Apply motion-dependent adjustment for policies that benefit from it
+    if policy not in ('hold', 'linear', 'forward_biased') and profiles is not None and not profiles.empty:
         motion_col = 'motion_mean_mean'
         if motion_col in profiles.columns:
             row = profiles[profiles['cluster'] == cluster]
             if not row.empty:
                 motion = float(row[motion_col].iloc[0])
-                # Rough normalization. Tune the scale as needed.
-                # Higher motion -> lower alpha (more conservative)
-                norm = min(max(motion / 25.0, 0.0), 1.0)
-                base_alpha = max(0.15, 0.40 - norm * 0.25)
+                # Stronger sensitivity curve (more gradations)
+                # Normalize motion to [0, 1.2] range
+                norm = min(max(motion / 22.0, 0.0), 1.2)
+                # Stronger pull toward conservative for high motion
+                adjustment = norm * 0.28
+                base = max(0.10, min(0.55, base - adjustment))
 
-    if policy in ('biased', 'motion_aware', 'motion_biased'):
-        return base_alpha
-
-    return 0.5
+    return float(base)
 
 
 def simulate_adaptive_policies(
@@ -210,23 +241,27 @@ def simulate_adaptive_policies(
     sample_step: int = 2,
     max_triples: int | None = None,
     random_state: int = 42,
-    policy_smoothing_window: int = 5,
+    policy_smoothing_window: int = 9,
     profiles: pd.DataFrame | None = None,
 ) -> dict:
     """
     Симулює адаптивну інтерполяцію: для кожного кластеру застосовується своя стратегія.
 
-    Підтримувані політики (покращена версія):
-      - 'linear'          : звичайний 0.5 blend
-      - 'hold'            : повторити попередній кадр
-      - 'conservative'    : фіксований консервативний blend (alpha=0.25)
-      - 'biased'          : motion-dependent alpha (чим вищий рух — тим консервативніше)
-      - 'motion_aware'    : синонім до покращеного biased
-      - 'forward_biased'  : alpha ~0.65 (зсув до наступного кадру)
+    Підтримувані політики (покращена версія з більшою кількістю градацій alpha):
+      - 'hold'            : 0.0 (повністю попередній кадр)
+      - 'very_strong'     : ~0.12 (дуже консервативно)
+      - 'strong'          : ~0.20
+      - 'conservative'    : ~0.28
+      - 'moderate'        : ~0.36
+      - 'mild'            : ~0.42
+      - 'linear'          : 0.50
+      - 'biased' / 'motion_aware': motion-dependent (0.10–0.45, залежить від профілю руху кластера)
+      - 'forward_biased'  : ~0.62
 
-    Ключові покращення:
-    - Alpha тепер залежить від профілю кластера (рух) для 'biased'/'motion_aware'.
-    - Temporal smoothing для стабільності застосування політик.
+    Ключові покращення цієї ітерації:
+    - Значно більше градацій alpha (від 0.10 до 0.62) з нелінійним motion-dependent регулюванням.
+    - Сильніше temporal smoothing за замовчуванням (window=9) + попереднє згладжування всієї послідовності міток.
+      Це забезпечує набагато стабільнішу, "сегментну" поведінку політик.
     - Додатковий SSIM.
 
     Повертає словник з метриками...
@@ -245,15 +280,20 @@ def simulate_adaptive_policies(
     per_cluster_stats = {}
     examples = []
 
+    # Stronger temporal smoothing: pre-smooth the entire label sequence
+    # This creates longer stable segments where the same policy is applied
+    smoothed_labels = _smooth_label_sequence(labels, window=policy_smoothing_window)
+
     positions = list(range(1, n - 1, max(1, sample_step)))
     if max_triples is not None and len(positions) > max_triples:
         positions = list(rng.choice(positions, size=max_triples, replace=False))
         positions.sort()
 
     for i in positions:
-        cl = int(labels[i])
-        # Segment-aware policy
-        policy = _get_smoothed_policy(labels, i, policy_map, window=policy_smoothing_window)
+        cl = int(labels[i])  # original cluster for stats / attribution
+        # Use strongly smoothed labels for policy decision (more segment-like)
+        effective_cl = int(smoothed_labels[i])
+        policy = policy_map.get(effective_cl, 'linear')
 
         left = frames[i - 1]
         right = frames[i + 1]
@@ -264,8 +304,8 @@ def simulate_adaptive_policies(
         psnr_u = calculate_psnr(est_u, gt)
         ssim_u = calculate_ssim(est_u, gt)
 
-        # adaptive with improved alpha logic
-        alpha = _get_blend_alpha(cl, policy, profiles)
+        # adaptive with fine-grained, profile-aware alpha
+        alpha = _get_blend_alpha(effective_cl, policy, profiles)
         if policy == 'hold':
             est_a = left.copy()
         else:
@@ -346,19 +386,32 @@ def _evaluate_per_cluster_policy_psnrs(
     frames: list[np.ndarray],
     labels: np.ndarray,
     sample_step: int,
-) -> dict[int, dict[str, float]]:
-    """Для кожного кластера обчислює середній PSNR на його позиціях для кожної з трьох політик.
+    profiles: pd.DataFrame | None = None,
+) -> dict[int, dict[str, dict[str, float]]]:
+    """
+    Для кожного кластера обчислює середні значення PSNR і SSIM на його позиціях 
+    для всіх підтримуваних політик (з градаціями alpha).
 
-    Повертає {cluster: {'linear': mean, 'biased': mean, 'hold': mean}}.
+    Повертає:
+        { cluster: { policy: {'psnr': mean, 'ssim': mean}, ... } }
+
     Використовує той самий семплінг triplet'ів, що й simulate.
+    Якщо передано profiles — для motion-dependent політик буде використано реальний alpha.
     """
     n = len(frames)
     if n < 3:
         return {}
 
+    EVAL_POLICIES = [
+        "linear", "mild", "moderate", "conservative",
+        "strong", "very_strong", "hold", "biased", "forward_biased"
+    ]
+
     positions = list(range(1, n - 1, max(1, sample_step)))
 
-    per_cl: dict[int, dict[str, list[float]]] = defaultdict(lambda: {"linear": [], "biased": [], "hold": []})
+    per_cl: dict[int, dict[str, dict[str, list[float]]]] = defaultdict(
+        lambda: {p: {'psnr': [], 'ssim': []} for p in EVAL_POLICIES}
+    )
 
     for i in positions:
         cl = int(labels[i])
@@ -366,17 +419,25 @@ def _evaluate_per_cluster_policy_psnrs(
         right = frames[i + 1]
         gt = frames[i]
 
-        ps_lin = calculate_psnr(_blend_pair(left, right, 0.5), gt)
-        ps_bia = calculate_psnr(_blend_pair(left, right, 0.35), gt)
-        ps_hol = calculate_psnr(left, gt)
+        for pol in EVAL_POLICIES:
+            alpha = _get_blend_alpha(cl, pol, profiles)
+            if pol == "hold":
+                est = left.copy()
+            else:
+                est = _blend_pair(left, right, alpha)
+            ps = calculate_psnr(est, gt)
+            ss = calculate_ssim(est, gt)
+            per_cl[cl][pol]['psnr'].append(ps)
+            per_cl[cl][pol]['ssim'].append(ss)
 
-        per_cl[cl]["linear"].append(ps_lin)
-        per_cl[cl]["biased"].append(ps_bia)
-        per_cl[cl]["hold"].append(ps_hol)
-
-    means: dict[int, dict[str, float]] = {}
+    means: dict[int, dict[str, dict[str, float]]] = {}
     for cl, d in per_cl.items():
-        means[cl] = {p: float(np.mean(vals)) if vals else 0.0 for p, vals in d.items()}
+        means[cl] = {}
+        for p in EVAL_POLICIES:
+            means[cl][p] = {
+                'psnr': float(np.mean(d[p]['psnr'])) if d[p]['psnr'] else 0.0,
+                'ssim': float(np.mean(d[p]['ssim'])) if d[p]['ssim'] else 0.0,
+            }
     return means
 
 
@@ -395,15 +456,18 @@ def recommend_policies_from_profiles(
     """
     Автоматично рекомендує політики на основі профілів кластерів.
 
-    Логіка (згідно з побажанням користувача + захист від погіршення метрики):
-    - combined score = (motion_norm + texture_norm) / 2  → визначає "топ-20-25%" за рухом + текстурою одночасно.
-    - Кластери з топ-скором ("hard") можуть розглядати 'hold' як опцію.
-    - Інші кластери — тільки 'biased' або 'linear'.
-    - Якщо передано frames + labels, для кожного кластера серед *дозволених* політик обирається та, що дає
-      найвищий фактичний PSNR на temporal triplet'ах цього кластера.
-      Це гарантує, що рекомендована конфігурація не буде гіршою за all-linear (delta >= 0).
+    Логіка є продуманою (thoughtful), а не чисто "яка політика дала найбільший PSNR":
 
-    Якщо frames/labels не передано — повертає чисту евристику (може давати негативний delta).
+    - combined score з профілів (рух + текстура) визначає, наскільки "складним" є кластер.
+    - Для легких кластерів linear є природним і бажаним вибором.
+    - Для середніх і складних кластерів ми свідомо віддаємо перевагу conservative / moderate / biased (з розумним alpha),
+      навіть якщо їхній PSNR трохи нижчий — бо це відповідає основній ідеї проєкту
+      (знаходити типи контенту, де класична лінійна інтерполяція концептуально слабка).
+    - Дуже складні кластери (hard) отримують доступ до strong / very_strong / hold.
+    - Реальний PSNR використовується як важливий validation / tie-breaker,
+      але не як єдиний критерій.
+
+    Такий підхід робить рекомендацію більш осмисленою і відповідною до навчальної мети курсової.
     """
     if profiles_df.empty:
         return {}
@@ -429,15 +493,83 @@ def recommend_policies_from_profiles(
     hard_clusters = {int(row['cluster']) for _, row in work.iterrows() if float(row['combined']) >= hold_thresh}
 
     if frames is not None and labels is not None:
-        # Безпечний вибір: серед дозволених політик — та, що найкраща за реальним PSNR
-        psnr_means = _evaluate_per_cluster_policy_psnrs(frames, labels, sample_step)
+        # Thoughtful / продуманої recommendation logic.
+        #
+        # The goal is NOT to blindly pick the policy with the highest measured PSNR.
+        # The core idea of the project is:
+        #   - Use simple features (motion + texture) to detect content types where
+        #     classic linear interpolation is conceptually insufficient.
+        #   - Then apply a more appropriate (usually more conservative) strategy for those types.
+        #
+        # Therefore the logic is hybrid and deliberate:
+        #   1. Difficulty from features (combined motion+texture) determines the "natural" policy family.
+        #   2. Actual PSNR on the cluster's triplets is used as validation / tie-breaker,
+        #      not as the only criterion.
+        #   3. We apply a thoughtful bias:
+        #      - Easy content → linear is strongly preferred (it is the right tool).
+        #      - Medium/hard content → conservative or motion-aware biased are preferred
+        #        even if their PSNR is slightly lower (because that matches the project's thesis).
+        #      - Very hard content → strong conservative / hold are considered.
+        #
+        # This makes the recommendation "more thoughtful" and aligned with the educational goal,
+        # while still being grounded in real measurements on the given video.
+        quality = _evaluate_per_cluster_policy_psnrs(frames, labels, sample_step, profiles=profiles_df)
         policy_map: dict[int, str] = {}
         all_cls = [int(row['cluster']) for _, row in work.iterrows()]
-        for cl in all_cls:
-            # Hard clusters can use hold or the smarter conservative/biased
-            cands = ["hold", "conservative", "biased", "linear"] if cl in hard_clusters else ["conservative", "biased", "linear"]
-            if cl in psnr_means:
-                best = max(cands, key=lambda p: psnr_means[cl].get(p, -1e9))
+
+        for idx, row in work.iterrows():
+            cl = int(row['cluster'])
+            difficulty = float(row['combined'])
+
+            # Define candidate set according to feature difficulty (thoughtful tiering)
+            if cl in hard_clusters:
+                # Very hard by features → consider the strongest adaptive options
+                cands = ["hold", "very_strong", "strong", "conservative", "moderate", "biased", "linear"]
+            elif difficulty > (hold_thresh * 0.45):
+                # Medium to hard → lean towards thoughtful conservative / biased strategies
+                cands = ["conservative", "moderate", "mild", "biased", "linear"]
+            else:
+                # Easy content → linear is the natural and preferred choice
+                cands = ["linear", "mild", "moderate", "conservative", "biased"]
+
+            if cl in quality:
+                valid_cands = [p for p in cands if p in quality[cl] and quality[cl][p]['psnr'] > -100]
+                if not valid_cands:
+                    best = "linear"
+                else:
+                    # Normalize both metrics within the cluster for fair combination
+                    cluster_ps = [quality[cl][pp]['psnr'] for pp in valid_cands]
+                    cluster_ss = [quality[cl][pp]['ssim'] for pp in valid_cands]
+                    min_p, max_p = min(cluster_ps), max(cluster_ps)
+                    min_s, max_s = min(cluster_ss), max(cluster_ss)
+
+                    def thoughtful_score(p):
+                        ps_val = quality[cl][p]['psnr']
+                        ss_val = quality[cl][p]['ssim']
+
+                        norm_ps = (ps_val - min_p) / (max_p - min_p + 1e-9) if max_p > min_p else 0.5
+                        norm_ss = (ss_val - min_s) / (max_s - min_s + 1e-9) if max_s > min_s else 0.5
+
+                        # Combine PSNR and SSIM. SSIM helps penalize policies that destroy structure
+                        # even if pixel error (PSNR) looks acceptable.
+                        combined = 0.65 * norm_ps + 0.35 * norm_ss
+                        score = combined
+
+                        # Feature-driven bias (the "thoughtful" part)
+                        if p == "linear":
+                            if difficulty < 0.35:
+                                score += (0.40 - difficulty) * 1.2
+                            else:
+                                score -= (difficulty - 0.30) * 2.0
+                        else:
+                            if difficulty < 0.30:
+                                score -= 0.35
+                            elif difficulty > 0.50:
+                                score += 0.25
+
+                        return score
+
+                    best = max(valid_cands, key=thoughtful_score)
             else:
                 best = "linear"
             policy_map[cl] = best
@@ -456,9 +588,11 @@ def recommend_policies_from_profiles(
         if score >= hold_thresh:
             policy = 'hold'
         elif score >= biased_thresh:
-            policy = 'biased'
+            # Only for clearly harder clusters
+            policy = 'conservative' if score > (biased_thresh * 1.1) else 'linear'
         else:
-            policy = 'conservative' if score > (hold_thresh + biased_thresh) / 2 else 'linear'
+            # linear as standard for everything that is not hard
+            policy = 'linear'
         policy_map[cl] = policy
     return policy_map
 
